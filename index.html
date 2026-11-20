@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Code Progress Tracker</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <section class="code-section" aria-label="Code">
+      <div class="pane-bar">
+        <button type="button" id="save-page">Save</button>
+      </div>
+      <div class="editor">
+        <button type="button" id="prev-file" class="nav-arrow nav-arrow-left" aria-label="Previous file">←</button>
+        <button type="button" id="next-file" class="nav-arrow nav-arrow-right" aria-label="Next file">→</button>
+        <div class="active-line" id="active-line"></div>
+        <div class="gutter" aria-hidden="true">
+          <div class="gutter-lines" id="gutter-lines"></div>
+        </div>
+        <textarea
+          id="code"
+          wrap="off"
+          spellcheck="false"
+          autocomplete="off"
+          autocapitalize="off"
+          autocorrect="off"
+          aria-label="Editor"
+        ></textarea>
+      </div>
+    </section>
+
+    <section class="notes-section" aria-label="Notes">
+      <textarea
+        id="notes"
+        spellcheck="false"
+        autocomplete="off"
+        autocapitalize="off"
+        autocorrect="off"
+        aria-label="Notes"
+      ></textarea>
+    </section>
+
+    <script src="script.js"></script>
+  </body>
+</html>
