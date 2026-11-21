@@ -3,44 +3,26 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Code Progress Tracker</title>
+    <title>Development Log</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <section class="code-section" aria-label="Code">
-      <div class="pane-bar">
-        <button type="button" id="save-page">Save</button>
-      </div>
-      <div class="editor">
-        <button type="button" id="prev-file" class="nav-arrow nav-arrow-left" aria-label="Previous file">←</button>
-        <button type="button" id="next-file" class="nav-arrow nav-arrow-right" aria-label="Next file">→</button>
-        <div class="active-line" id="active-line"></div>
-        <div class="gutter" aria-hidden="true">
-          <div class="gutter-lines" id="gutter-lines"></div>
+    <div class="track" id="track"></div>
+    <div class="sheet" id="sheet" aria-hidden="true">
+      <div class="sheet-label" id="sheet-label">+</div>
+      <div class="composer" id="composer" inert>
+        <div class="project-head">
+          <input class="stamp" id="version-stamp" type="text" readonly tabindex="-1" aria-label="Created" hidden />
+          <textarea class="version-title" id="version-title" placeholder="title" aria-label="Title"></textarea>
         </div>
-        <textarea
-          id="code"
-          wrap="off"
-          spellcheck="false"
-          autocomplete="off"
-          autocapitalize="off"
-          autocorrect="off"
-          aria-label="Editor"
-        ></textarea>
+        <div id="entries"></div>
+        <button type="button" class="add-file" id="add-file" aria-label="Add file">+</button>
       </div>
-    </section>
-
-    <section class="notes-section" aria-label="Notes">
-      <textarea
-        id="notes"
-        spellcheck="false"
-        autocomplete="off"
-        autocapitalize="off"
-        autocorrect="off"
-        aria-label="Notes"
-      ></textarea>
-    </section>
-
+      <div class="sheet-actions">
+        <button type="button" class="save" id="save-project">Save</button>
+        <button type="button" class="close" id="close-project" aria-label="Close project">×</button>
+      </div>
+    </div>
     <script src="script.js"></script>
   </body>
 </html>
