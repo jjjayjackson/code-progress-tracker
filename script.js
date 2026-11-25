@@ -10,18 +10,52 @@ const stampInput = document.querySelector("#version-stamp");
 const titleInput = document.querySelector("#version-title");
 
 const STORAGE_KEY = "code-progress-tracker.project-draft";
+const TABLE = "code_progress_tracker";
 const TAB = "    ";
 
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const syncApi = window.CodeProgressSync;
+const supabase = createSupabase();
 
 let state = {
   activeId: null,
   versions: [],
+  deleted: [],
+  updatedAt: "",
 };
 
 let persistTimer = 0;
 let closing = false;
-let migrated = false;
+let localStatus = "missing";
+let preserveCorrupt = false;
+let dirtySinceLoad = false;
+let needsPush = false;
+let syncReady = false;
+let pushChain = Promise.resolve();
+let retryTimer = 0;
+let pushBursts = 0;
+
+function createSupabase() {
+  const config = window.CODE_PROGRESS_SUPABASE;
+  if (!config || !window.supabase || !config.url || !config.key) return null;
+  try {
+    return window.supabase.createClient(config.url, config.key, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+        storage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {},
+        },
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
 
 function createId() {
   if (window.crypto && typeof crypto.randomUUID === "function") {
@@ -38,26 +72,12 @@ function current() {
   return state.versions.find((version) => version.id === state.activeId) || null;
 }
 
-function normalizeEntry(entry) {
+function documentPayload() {
   return {
-    id: typeof entry?.id === "string" && entry.id ? entry.id : createId(),
-    name: typeof entry?.name === "string" ? entry.name : "",
-    content: typeof entry?.content === "string" ? entry.content : "",
-    comment: typeof entry?.comment === "string" ? entry.comment : "",
-  };
-}
-
-function normalizeVersion(raw) {
-  const entries = Array.isArray(raw?.entries) ? raw.entries.filter((entry) => entry && typeof entry === "object").map(normalizeEntry) : [];
-  return {
-    id: typeof raw?.id === "string" && raw.id ? raw.id : createId(),
-    saved: raw?.saved === true,
-    title: mergeTitle(
-      typeof raw?.title === "string" ? raw.title : "",
-      typeof raw?.description === "string" ? raw.description : "",
-    ),
-    createdAt: typeof raw?.createdAt === "string" && !Number.isNaN(Date.parse(raw.createdAt)) ? raw.createdAt : "",
-    entries,
+    activeId: state.activeId,
+    versions: state.versions,
+    deleted: state.deleted,
+    updatedAt: state.updatedAt,
   };
 }
 
@@ -74,26 +94,19 @@ function formatStamp(iso) {
   return `${month}.${day}.${year} ${hours}:${minutes} ${suffix}`;
 }
 
-function mergeTitle(title, description) {
-  const name = title.replace(/\s+$/, "");
-  const notes = description.replace(/^\s+/, "");
-  if (!notes.trim()) return name;
-  if (!name.trim()) return notes;
-  if (name.trim() === notes.trim()) return name;
-  return `${name}\n\n${notes}`;
-}
-
 function versionHasContent(version) {
   if (version.title.trim()) return true;
   return version.entries.some((entry) => entry.name || entry.content || entry.comment);
 }
 
 function createVersion() {
+  const now = new Date().toISOString();
   return {
     id: createId(),
     saved: false,
     title: "",
-    createdAt: new Date().toISOString(),
+    createdAt: now,
+    updatedAt: now,
     entries: [emptyEntry()],
   };
 }
@@ -193,45 +206,238 @@ function updateSheetLabel(version) {
   sheetLabel.classList.toggle("is-titled", titled);
 }
 
-function persistNow() {
-  window.clearTimeout(persistTimer);
+function touchDocument() {
+  state.updatedAt = new Date().toISOString();
+}
+
+function touchVersion(version) {
+  const now = new Date().toISOString();
+  state.updatedAt = now;
+  if (version) version.updatedAt = now;
+}
+
+function writeLocal() {
+  if (preserveCorrupt) return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(documentPayload()));
+    localStatus = "ok";
   } catch {
     // Storage can be unavailable; the in-memory draft still works.
   }
 }
 
+function persistNow(kind) {
+  window.clearTimeout(persistTimer);
+  if (kind === "version") touchVersion(current());
+  else if (kind === "document") touchDocument();
+  if (kind === "version" || kind === "document") {
+    preserveCorrupt = false;
+    dirtySinceLoad = true;
+    needsPush = true;
+  }
+  writeLocal();
+  requestPush();
+}
+
 function schedulePersist() {
   window.clearTimeout(persistTimer);
-  persistTimer = window.setTimeout(persistNow, 150);
+  persistTimer = window.setTimeout(() => persistNow("version"), 150);
+}
+
+function ensureActiveEntry() {
+  const active = current();
+  if (active && active.entries.length === 0) active.entries.push(emptyEntry());
 }
 
 function loadState() {
   const raw = readStored();
-  if (!raw) return;
+  if (raw == null) {
+    localStatus = "missing";
+    return;
+  }
 
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return;
-
-    if (Array.isArray(parsed.versions)) {
-      state.versions = parsed.versions.filter((version) => version && typeof version === "object").map(normalizeVersion);
-      state.activeId = typeof parsed.activeId === "string" ? parsed.activeId : null;
-      if (state.activeId && !current()) state.activeId = null;
-    } else {
-      const version = normalizeVersion(parsed);
-      const keep = version.saved || parsed.open === true || versionHasContent(version);
-      state.versions = keep ? [version] : [];
-      state.activeId = parsed.open === true && state.versions[0] ? state.versions[0].id : null;
-      migrated = keep;
+    const normalized = syncApi.normalizeState(parsed);
+    if (!normalized) {
+      localStatus = "corrupt";
+      preserveCorrupt = true;
+      return;
     }
-
-    const active = current();
-    if (active && active.entries.length === 0) active.entries.push(emptyEntry());
+    state = normalized;
+    localStatus = "ok";
+    ensureActiveEntry();
   } catch {
-    // Leave the stored value in place when it cannot be read.
+    localStatus = "corrupt";
+    preserveCorrupt = true;
   }
+}
+
+function scheduleRetry() {
+  if (retryTimer || !needsPush) return;
+  retryTimer = window.setTimeout(() => {
+    retryTimer = 0;
+    pushBursts = 0;
+    requestPush();
+  }, 8000);
+}
+
+function requestPush() {
+  if (!syncReady || !needsPush || !supabase) return;
+  pushChain = pushChain.then(pushLatest).catch((error) => {
+    console.error(error);
+    scheduleRetry();
+  });
+}
+
+async function fetchRemote() {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("active_id, versions, deleted, updated_at")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const normalized = syncApi.normalizeState({
+    activeId: data.active_id,
+    versions: data.versions,
+    deleted: data.deleted,
+    updatedAt: data.updated_at,
+  });
+  if (!normalized) throw new Error("Supabase returned an unreadable code-progress document.");
+  return normalized;
+}
+
+function applyDocument(next, remote) {
+  const previousActive = current();
+  const sheetOpen = sheet.classList.contains("is-present");
+  const before = syncApi.signature(state);
+  state.activeId = next.activeId;
+  state.versions = next.versions;
+  state.deleted = next.deleted;
+  state.updatedAt = next.updatedAt;
+  ensureActiveEntry();
+  needsPush = syncApi.signature(state) !== syncApi.signature(remote);
+  preserveCorrupt = false;
+  writeLocal();
+  if (syncApi.signature(state) === before) return;
+
+  renderTrack();
+  const version = current();
+  if (!version) {
+    if (sheetOpen) {
+      closing = false;
+      composer.inert = true;
+      sheet.setAttribute("aria-hidden", "true");
+      sheet.classList.remove("is-present", "is-open");
+      track.classList.remove("is-inactive");
+      releaseSheet();
+    }
+    return;
+  }
+
+  const focused = composer.contains(document.activeElement);
+  if (sheetOpen && focused && version === previousActive) return;
+
+  if (!sheetOpen) {
+    if (dirtySinceLoad) return;
+    syncProjectFields();
+    renderEntries();
+    updateSheetLabel(version);
+    composer.inert = false;
+    sheet.setAttribute("aria-hidden", "false");
+    expandSheet(false, cardRect(version));
+    return;
+  }
+
+  syncProjectFields();
+  renderEntries();
+  updateSheetLabel(version);
+}
+
+async function pushLatest() {
+  if (!needsPush || !supabase) return;
+  if (pushBursts > 4) {
+    scheduleRetry();
+    return;
+  }
+  pushBursts += 1;
+  if (!state.updatedAt) touchDocument();
+
+  const snapshot = JSON.parse(JSON.stringify(documentPayload()));
+  const sentSignature = syncApi.signature(snapshot);
+  const { data, error } = await supabase.rpc("save_code_progress_tracker", {
+    p_active_id: snapshot.activeId,
+    p_versions: snapshot.versions,
+    p_deleted: snapshot.deleted,
+    p_updated_at: snapshot.updatedAt,
+  });
+  if (error) throw error;
+
+  if (!data || data.applied === false) {
+    const remote = syncApi.normalizeState({
+      activeId: data?.active_id,
+      versions: data?.versions,
+      deleted: data?.deleted,
+      updatedAt: data?.updated_at,
+    });
+    if (remote) {
+      const merged = syncApi.mergeStates(state, remote);
+      applyDocument(merged, remote);
+    }
+  } else {
+    pushBursts = 0;
+    if (syncApi.signature(state) === sentSignature) {
+      needsPush = false;
+      if (typeof data.updated_at === "string" && data.updated_at) state.updatedAt = data.updated_at;
+      writeLocal();
+    }
+  }
+
+  if (needsPush) requestPush();
+}
+
+async function boot() {
+  if (!supabase) return;
+
+  let remote = null;
+  try {
+    remote = await fetchRemote();
+  } catch (error) {
+    console.error(error);
+    syncReady = true;
+    if (localStatus === "ok") {
+      needsPush = true;
+      scheduleRetry();
+    }
+    return;
+  }
+
+  if (localStatus === "corrupt") {
+    if (remote) {
+      state = remote;
+      ensureActiveEntry();
+      needsPush = false;
+      preserveCorrupt = false;
+      writeLocal();
+      renderTrack();
+      if (state.activeId) {
+        syncProjectFields();
+        renderEntries();
+        updateSheetLabel(current());
+        composer.inert = false;
+        sheet.setAttribute("aria-hidden", "false");
+        expandSheet(false, cardRect(current()));
+      }
+    }
+  } else {
+    const remoteState = remote || { activeId: null, versions: [], deleted: [], updatedAt: "" };
+    const merged = syncApi.mergeStates(state, remoteState);
+    applyDocument(merged, remoteState);
+  }
+
+  syncReady = true;
+  if (needsPush) requestPush();
 }
 
 function entryFromElement(element) {
@@ -279,47 +485,10 @@ function onCodeKeydown(event) {
   schedulePersist();
 }
 
-async function pasteInto(textarea) {
-  let text = "";
-  try {
-    text = await navigator.clipboard.readText();
-  } catch {
-    textarea.focus();
-    return;
-  }
-
-  const start = textarea.selectionStart;
-  const end = textarea.selectionEnd;
-  textarea.setRangeText(text, start, end, "end");
-  const entry = entryFromElement(textarea);
-  if (entry) entry.content = textarea.value;
-  persistNow();
-  textarea.focus();
-}
-
 function createEntryElement(entry) {
   const wrap = document.createElement("section");
   wrap.className = "entry";
   wrap.dataset.id = entry.id;
-
-  const bar = document.createElement("div");
-  bar.className = "entry-bar";
-
-  const name = document.createElement("input");
-  name.className = "filename";
-  name.type = "text";
-  name.value = entry.name;
-  name.placeholder = "filename";
-  name.spellcheck = false;
-  name.autocomplete = "off";
-  name.autocapitalize = "off";
-  name.autocorrect = "off";
-  name.setAttribute("aria-label", "Filename");
-
-  const paste = document.createElement("button");
-  paste.type = "button";
-  paste.className = "paste";
-  paste.textContent = "Paste";
 
   const code = document.createElement("textarea");
   code.className = "code";
@@ -329,18 +498,7 @@ function createEntryElement(entry) {
   code.autocomplete = "off";
   code.autocapitalize = "off";
   code.autocorrect = "off";
-  code.setAttribute("aria-label", "File contents");
-
-  const comment = document.createElement("textarea");
-  comment.className = "comment";
-  comment.value = entry.comment;
-  comment.placeholder = "comment";
-  comment.setAttribute("aria-label", "Comment");
-
-  name.addEventListener("input", () => {
-    entry.name = name.value;
-    schedulePersist();
-  });
+  code.setAttribute("aria-label", "Code");
 
   code.addEventListener("input", () => {
     entry.content = code.value;
@@ -348,20 +506,7 @@ function createEntryElement(entry) {
   });
   code.addEventListener("keydown", onCodeKeydown);
 
-  comment.addEventListener("input", () => {
-    entry.comment = comment.value;
-    schedulePersist();
-  });
-
-  paste.addEventListener("mousedown", (event) => {
-    event.preventDefault();
-  });
-  paste.addEventListener("click", () => {
-    pasteInto(code);
-  });
-
-  bar.append(name, paste);
-  wrap.append(bar, code, comment);
+  wrap.append(code);
   return wrap;
 }
 
@@ -467,7 +612,7 @@ function finishClose(focusId) {
   sheet.setAttribute("aria-hidden", "true");
   sheet.classList.remove("is-present", "is-open");
   releaseSheet();
-  persistNow();
+  persistNow("document");
   const button = (focusId && track.querySelector(`[data-version-id="${focusId}"]`)) || track.querySelector(".card-plus");
   button?.focus({ preventScroll: true });
 }
@@ -495,7 +640,11 @@ function closeProject() {
   if (!state.activeId || closing) return;
   const version = current();
   if (version && !version.saved && !versionHasContent(version)) {
+    const deletedAt = new Date().toISOString();
+    state.deleted = state.deleted.filter((item) => item.id !== version.id);
+    state.deleted.push({ id: version.id, deletedAt });
     state.versions = state.versions.filter((item) => item.id !== version.id);
+    state.updatedAt = deletedAt;
     state.activeId = null;
   }
   renderTrack();
@@ -517,7 +666,7 @@ function openVersion(id) {
   updateSheetLabel(version);
   composer.inert = false;
   sheet.setAttribute("aria-hidden", "false");
-  persistNow();
+  persistNow("document");
   expandSheet(!reduceMotion, origin);
 
   window.setTimeout(() => {
@@ -533,7 +682,7 @@ function saveProject() {
   version.saved = true;
   updateSheetLabel(version);
   renderTrack();
-  persistNow();
+  persistNow("version");
 }
 
 function addEntry() {
@@ -543,14 +692,13 @@ function addEntry() {
   version.entries.push(entry);
   const element = createEntryElement(entry);
   entriesEl.append(element);
-  persistNow();
+  persistNow("version");
   element.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
   element.querySelector(".code")?.focus();
 }
 
 loadState();
 renderTrack();
-if (migrated) persistNow();
 
 if (state.activeId) {
   syncProjectFields();
@@ -586,4 +734,25 @@ window.addEventListener("resize", () => {
   sheet.classList.remove("is-instant");
 });
 
-window.addEventListener("pagehide", persistNow);
+window.addEventListener("pagehide", () => {
+  if (persistTimer) persistNow("version");
+  else persistNow("keep");
+});
+
+window.addEventListener("online", () => {
+  if (!needsPush) return;
+  window.clearTimeout(retryTimer);
+  retryTimer = 0;
+  pushBursts = 0;
+  requestPush();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !needsPush) return;
+  window.clearTimeout(retryTimer);
+  retryTimer = 0;
+  pushBursts = 0;
+  requestPush();
+});
+
+boot();
